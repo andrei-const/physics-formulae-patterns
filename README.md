@@ -28,6 +28,8 @@ archivePrefix = {arXiv},
 
 The function sets used for the analysis can be found in the `data/` directory.
 
+To generate random algebraic expressions, one can use the Mathematica notebook `RandomExpressions.nb'.
+
 To perform the implicit inference tests, one can use the script `ili_zipf.py`, which utilises the `ltu-ili`
 package ([Ho et al. 2024](https://arxiv.org/abs/2402.05137)). This can be downloaded and installed as follows
 
