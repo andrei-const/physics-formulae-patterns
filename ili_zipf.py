@@ -2,7 +2,7 @@ import numpy as np
 import os
 import matplotlib.pyplot as plt
 from collections import Counter
-from scipy.optimize import curve_fit, minimize
+from scipy.optimize import curve_fit, minimize, leastsq
 import torch
 import matplotlib.colors as mcolors
 import signal
@@ -11,6 +11,7 @@ import pickle
 from sklearn.model_selection import train_test_split
 import sys
 import warnings
+from tqdm import tqdm
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -126,6 +127,25 @@ def generate_from_exponential(N, beta, Nmax=1000):
 
     return obs
 
+
+def generate_from_double_exponential(N, beta, gamma, Nmax=1000):
+
+    # Generate a list of integers from 1 to Nmax
+    x = np.arange(1, Nmax+1)
+    # Compute the probabilities of each integer
+    p = np.exp(gamma * np.exp(- beta * x / gamma))
+    # Normalize the probabilities
+    p = p / np.sum(p)
+    # Generate a sample of size N from the integers with probabilities p
+    samps = np.random.choice(x, N, p=p, replace=True)
+
+    # Use Counter to count the occurrences of each integer
+    counter = Counter(samps)
+    obs = np.array(list(counter.values()))
+    obs = np.sort(obs)[::-1]
+
+    return obs
+
 # --------------------------------------------
 # Fitting functions
 # --------------------------------------------
@@ -147,7 +167,10 @@ def fit_to_zipf(obs):
             return A * obs.sum() * y
         
         with suppress_stdout():
-            popt, _ = curve_fit(zipf, rank, obs)
+            # popt, _ = curve_fit(zipf, rank, obs)
+            x0 = np.array([1., 1.])
+            result = leastsq(lambda p: obs- zipf(rank, *p), x0, full_output=True, maxfev=800)
+            popt = result[0]  # Best-fit parameters
         log_mse = np.mean(np.power(np.log(zipf(rank, *popt) + 1) - np.log(obs + 1), 2))
 
     return list(popt) + [log_mse]
@@ -174,7 +197,10 @@ def fit_to_zipf_mandel(obs):
             return A * obs.sum() * y
         
         with suppress_stdout():
-            popt, _ = curve_fit(zipf_mandel, rank, obs)
+            # popt, _ = curve_fit(zipf_mandel, rank, obs)
+            x0 = np.array([1., 1., 1.])
+            result = leastsq(lambda p: obs- zipf_mandel(rank, *p), x0, full_output=True, maxfev=800)
+            popt = result[0]  # Best-fit parameters
         log_mse = np.mean(np.power(np.log(zipf_mandel(rank, *popt) + 1) - np.log(obs + 1), 2))
 
     return list(popt) + [log_mse]
@@ -182,7 +208,7 @@ def fit_to_zipf_mandel(obs):
 
 def fit_to_exponential(obs):
     """
-    Fit the observed distribution to an exponential distribution and return the estimated beta and gamma.
+    Fit the observed distribution to an exponential distribution and return the estimated A and beta.
     """
 
     rank = np.arange(1, len(obs)+1)
@@ -197,10 +223,40 @@ def fit_to_exponential(obs):
             return A * obs.sum() * y
         
         with suppress_stdout():
-            popt, _ = curve_fit(exponential, rank, obs)
+            # popt, _ = curve_fit(exponential, rank, obs)
+            x0 = np.array([1., 1.,])
+            result = leastsq(lambda p: obs- exponential(rank, *p), x0, full_output=True, maxfev=800)
+            popt = result[0]  # Best-fit parameters
         log_mse = np.mean(np.power(np.log(exponential(rank, *popt) + 1) - np.log(obs + 1), 2))
 
     return list(popt) + [log_mse]
+
+
+def fit_to_double_exponential(obs):
+    """
+    Fit the observed distribution to a double exponential distribution and return the estimated A, beta and gamma.
+    """
+
+    rank = np.arange(1, len(obs)+1)
+
+    if len(obs) <= 2:
+        popt = [1, 0, 0]
+        log_mse = 0
+    else:
+        def double_exponential(x, A, beta, gamma):
+            y = np.exp(gamma * np.exp(- beta * x / gamma))
+            y /= np.sum(y)
+            return A * obs.sum() * y
+        
+        with suppress_stdout():
+            # popt, _ = curve_fit(double_exponential, rank, obs)
+            x0 = np.array([1., 1., 1.])
+            result = leastsq(lambda p: obs- double_exponential(rank, *p), x0, full_output=True, maxfev=800)
+            popt = result[0]  # Best-fit parameters
+        log_mse = np.mean(np.power(np.log(double_exponential(rank, *popt) + 1) - np.log(obs + 1), 2))
+
+    return list(popt) + [log_mse]
+
 
 # --------------------------------------------
 # Simulators
@@ -213,6 +269,7 @@ def create_compressed_obs(obs):
     zipf_fit = fit_to_zipf(obs)
     zipf_mandel_fit = fit_to_zipf_mandel(obs)
     exponential_fit = fit_to_exponential(obs)
+    double_exponential_fit = fit_to_double_exponential(obs)
 
     return np.array(list(zipf_fit) + list(zipf_mandel_fit) + list(exponential_fit) + [len(obs)])
 
@@ -243,6 +300,16 @@ def exponential_simulator(N, beta, Nmax=1000):
     """
 
     obs = generate_from_exponential(N, beta, Nmax)
+
+    return create_compressed_obs(obs)
+
+
+def double_exponential_simulator(N, beta, gamma, Nmax=1000):
+    """
+    Generate a sample of size N from a double exponential distribution with parameters beta and gamma and fit the distribution.
+    """
+
+    obs = generate_from_double_exponential(N, beta, gamma, Nmax)
 
     return create_compressed_obs(obs)
 
@@ -278,16 +345,20 @@ def train_estimator(loader, prior, x, theta, name, output_dir, engine='NLE'):
         os.mkdir(f'{output_dir}/{name}_{engine}')
 
     # instantiate your neural networks to be used as an ensemble
-    nets = [
-        ili.utils.load_nde_sbi(engine=engine, model='maf', hidden_features=50, num_transforms=5),
-        ili.utils.load_nde_sbi(engine=engine, model='mdn', hidden_features=50, num_components=6)
-    ]
     # nets = [
     #     ili.utils.load_nde_sbi(engine=engine, model='maf', hidden_features=50, num_transforms=5),
-    #     ili.utils.load_nde_sbi(engine=engine, model='maf', hidden_features=25, num_transforms=5),
-    #     ili.utils.load_nde_sbi(engine=engine, model='mdn', hidden_features=50, num_components=5),
-    #     ili.utils.load_nde_sbi(engine=engine, model='mdn', hidden_features=25, num_components=5)
+    #     ili.utils.load_nde_sbi(engine=engine, model='mdn', hidden_features=50, num_components=6)
     # ]
+    nets = [
+        ili.utils.load_nde_sbi(engine=engine, model='maf', hidden_features=50, num_transforms=3),
+        ili.utils.load_nde_sbi(engine=engine, model='maf', hidden_features=50, num_transforms=4),
+        ili.utils.load_nde_sbi(engine=engine, model='maf', hidden_features=25, num_transforms=5),
+        ili.utils.load_nde_sbi(engine=engine, model='maf', hidden_features=25, num_transforms=6),
+        ili.utils.load_nde_sbi(engine=engine, model='mdn', hidden_features=25, num_components=3),
+        ili.utils.load_nde_sbi(engine=engine, model='mdn', hidden_features=25, num_components=4),
+        ili.utils.load_nde_sbi(engine=engine, model='mdn', hidden_features=50, num_components=5),
+        ili.utils.load_nde_sbi(engine=engine, model='mdn', hidden_features=50, num_components=6)
+    ]
 
     # define training arguments
     train_args = {
@@ -335,6 +406,8 @@ def train_estimator(loader, prior, x, theta, name, output_dir, engine='NLE'):
         labels = [r'$\alpha^{-1}$', r'$b$']
     elif name == 'exponential':
         labels = [r'$\beta$']
+    elif name == 'double_exponential':
+        labels = [r'$\beta$', r'$\gamma$']
     else:
         raise ValueError('Unknown simulator')
     
@@ -348,9 +421,9 @@ def train_estimator(loader, prior, x, theta, name, output_dir, engine='NLE'):
     else:
         raise ValueError('Unknown engine')
     
-    if engine == 'NLE':
-        plt.close('all')
-        return posterior_ensemble, summaries
+    # if engine == 'NLE':
+    #     plt.close('all')
+    #     return posterior_ensemble, summaries
     
     try:
         with time_limit(120):
@@ -402,15 +475,18 @@ def train_estimator(loader, prior, x, theta, name, output_dir, engine='NLE'):
     return posterior_ensemble, summaries
 
 
-def train(N, Nsim, output_dir, to_train=['zipf', 'zipf_mandel', 'exponential'], train_nle=False, test_size=0.2):
+def train(N, Nsim, output_dir, 
+          to_train=['zipf', 'zipf_mandel', 'exponential', 'double_exponential'], 
+          train_npe=True, train_nle=False, test_size=0.2):
     """
-    Train NPE and NLE on Zipf, Zipf-Mandelbrot and Exponential distributions.
+    Train NPE and NLE on Zipf, Zipf-Mandelbrot, Exponential and DoubleExponential distributions.
 
     Args:
         :N (int): number of words in corpus
         :Nsim (int): number of simulations to generate
         :output_dir (str): output directory
         :to_train (list): list of simulators to train
+        :train_npe (bool): if True, train NPE
         :train_nle (bool): if True, train NLE
         :test_size (float): test size for train-test split
 
@@ -425,30 +501,35 @@ def train(N, Nsim, output_dir, to_train=['zipf', 'zipf_mandel', 'exponential'], 
     b_min = 2                             # Minimum value of offset b in Zipf-Mandelbrot
     b_max = 20                              # Maximum value of offset b in Zipf-Mandelbrot
     beta_min = 0.1                          # Minimum value of beta in exponential distribution
-    beta_max = 3                            # Maximum value of beta in exponential distribution
+    beta_max = 1                            # Maximum value of beta in exponential distribution
+    gamma_min = 0.1                          # Minimum value of beta in exponential distribution
+    gamma_max = 30                            # Maximum value of beta in exponential distribution
+    # all_nle = []
+    # all_npe = []
+    # all_loader = []
+    all_nle = {}
+    all_npe = {}
+    all_loader = {}
 
-    all_nle = []
-    all_npe = []
-    all_loader = []
-
-    for name, sim in zip(['zipf', 'zipf_mandel', 'exponential'], [zipf_simulator, zipf_mandel_simulator, exponential_simulator]):
+    for name, sim in zip(['zipf', 'zipf_mandel', 'exponential', 'double_exponential'], [zipf_simulator, zipf_mandel_simulator, exponential_simulator, double_exponential_simulator]):
 
         print('\n' + '-'*50)
         print('\nSimulator:', name)
         print('\n' + '-'*50 + '\n')
 
-        if name not in to_train:
+        # if name not in to_train:
             
-            print('Loading posterior ensembles from file')
-            if train_nle:
-                with open(f'{output_dir}/{name}_nle/posterior_ensemble.pkl', 'rb') as f:
-                    all_nle.append(pickle.load(f))
-            try:
-                with open(f'{output_dir}/{name}_npe/posterior_ensemble.pkl', 'rb') as f:
-                    all_npe.append(pickle.load(f))
-            except FileNotFoundError:
-                print('NPE not found')
-                all_npe.append(None)
+        #     print('Loading posterior ensembles from file')
+        #     if train_nle:
+        #         with open(f'{output_dir}/{name}_nle/posterior_ensemble.pkl', 'rb') as f:
+        #             all_nle[name] = pickle.load(f)
+        #     if train_npe:
+        #         try:
+        #             with open(f'{output_dir}/{name}_npe/posterior_ensemble.pkl', 'rb') as f:
+        #                 all_npe[name] = pickle.load(f)
+        #         except FileNotFoundError:
+        #             print('NPE not found')
+        #             all_npe[name] = None
 
 
         # Generate data
@@ -464,10 +545,22 @@ def train(N, Nsim, output_dir, to_train=['zipf', 'zipf_mandel', 'exponential'], 
         elif name == 'exponential':
             theta = np.random.uniform(low=beta_min, high=beta_max, size=Nsim)
             theta = np.expand_dims(theta, axis=1)
+        elif name == 'double_exponential':
+            theta = np.vstack(
+                [np.random.uniform(low=beta_min, high=beta_max, size=Nsim), 
+                np.random.uniform(low=gamma_min, high=gamma_max, size=Nsim)]).T
         else:
             raise ValueError('Unknown simulator')
         
-        x = np.array([sim(N, *t) for t in theta])
+        x = []
+        for i in tqdm(range(Nsim), desc='Generating data'):
+            with np.errstate(over='ignore'):
+                # Generate data from the simulator
+                # sim(N, *theta[i]) returns a compressed version of the observed distribution
+                # x.append(sim(N, *theta[i]))
+                x.append(sim(N, *theta[i]))
+        x = np.array(x)
+        # x = np.array([sim(N, *t) for t in theta])
 
         # Test-train split
         x_train, x_test, theta_train, theta_test = train_test_split(x, theta, test_size=test_size, random_state=42)
@@ -477,7 +570,7 @@ def train(N, Nsim, output_dir, to_train=['zipf', 'zipf_mandel', 'exponential'], 
 
         # make a dataloader
         loader = NumpyLoader(x=x_train, theta=theta_train)
-        all_loader.append(loader)
+        all_loader[name] = loader
 
         if name in to_train:
 
@@ -488,30 +581,34 @@ def train(N, Nsim, output_dir, to_train=['zipf', 'zipf_mandel', 'exponential'], 
                 prior = ili.utils.Uniform(low=[1 / alpha_max, 1 / b_max], high=[1 / alpha_min, 1 / b_min], device=device)
             elif name == 'exponential':
                 prior = ili.utils.Uniform(low=[beta_min], high=[beta_max], device=device)
+            elif name == 'double_exponential':
+                prior = ili.utils.Uniform(low=[beta_min, gamma_min], high=[beta_max, gamma_max], device=device)
             else:
                 raise ValueError('Unknown simulator')
 
             if train_nle:
                 posterior_ensemble, _ = train_estimator(loader, prior, x_test, theta_test, name, output_dir, engine='NLE')
-                all_nle.append(posterior_ensemble)
-            posterior_ensemble, _ = train_estimator(loader, prior, x_test, theta_test, name, output_dir, engine='NPE')
-            all_npe.append(posterior_ensemble)
+                all_nle[name] = posterior_ensemble
+            if train_npe:
+                posterior_ensemble, _ = train_estimator(loader, prior, x_test, theta_test, name, output_dir, engine='NPE')
+                all_npe[name] = posterior_ensemble
         else:
             print('Loading posterior ensembles from file')
             if train_nle:
                 with open(f'{output_dir}/{name}_nle/posterior_ensemble.pkl', 'rb') as f:
-                    all_nle.append(pickle.load(f))
-            try:
-                with open(f'{output_dir}/{name}_npe/posterior_ensemble.pkl', 'rb') as f:
-                    all_npe.append(pickle.load(f))
-            except FileNotFoundError:
-                print('NPE not found')
-                all_npe.append(None)
+                    all_nle[name] = pickle.load(f)
+            if train_npe:
+                try:
+                    with open(f'{output_dir}/{name}_npe/posterior_ensemble.pkl', 'rb') as f:
+                        all_npe[name] = pickle.load(f)
+                except FileNotFoundError:
+                    print('NPE not found')
+                    all_npe[name] = None
 
     return all_nle, all_npe, all_loader
 
 
-def train_evidence(N, all_nle, all_npe, all_loader, output_dir, evidence_estimator='evidence_network'):
+def train_evidence(N, all_nle, all_npe, all_loader, output_dir, evidence_estimator='evidence_network', reference_simulator='zipf'):
     """
     Train evidence network or harmonic mean estimator.
 
@@ -533,9 +630,13 @@ def train_evidence(N, all_nle, all_npe, all_loader, output_dir, evidence_estimat
 
         print('\nTraining evidence network')
 
-        all_name = ['zipf', 'zipf_mandel', 'exponential']
+        for name in all_npe.keys():
 
-        for i in range(len(all_loader)-1):
+            if name == reference_simulator:
+                print(f'Skipping {name} as it is the reference simulator')
+                continue
+
+            print(f'\nTraining evidence network for {name} vs {reference_simulator}')
 
             runner = K_EvidenceNetwork(
                 layer_width=64, added_layers=2,
@@ -546,10 +647,13 @@ def train_evidence(N, all_nle, all_npe, all_loader, output_dir, evidence_estimat
                     stop_after_epochs=100,
                     validation_fraction=0.1)
             )
-            
-            summary = runner.train(all_loader[-1], all_loader[i])
 
-            with open(f'{output_dir}/{all_name[i]}_{all_name[-1]}_evidence_network.pkl', 'wb') as f:
+            print(dir(all_loader[reference_simulator]))
+            print(all_loader[reference_simulator].x.shape, all_loader[name].x.shape)
+            print(all_loader[reference_simulator].theta.shape, all_loader[name].theta.shape)
+            summary = runner.train(all_loader[reference_simulator], all_loader[name])
+
+            with open(f'{output_dir}/{name}_{reference_simulator}_evidence_network.pkl', 'wb') as f:
                 pickle.dump(runner, f)
 
             plt.figure()
@@ -558,13 +662,12 @@ def train_evidence(N, all_nle, all_npe, all_loader, output_dir, evidence_estimat
             plt.yscale('log')
             plt.ylim(None, min(1, plt.gca().get_ylim()[1] * 2))
             plt.legend()
-            plt.savefig(f'{output_dir}/{all_name[i]}_{all_name[-1]}_evidence_loss.png', bbox_inches='tight')
-            plt.show()
+            plt.savefig(f'{output_dir}/{name}_{reference_simulator}_evidence_loss.png', bbox_inches='tight')
+            # plt.show()
 
-            if i < len(all_name):
-                print(f"Exponential vs {all_name[i]}: Predicted Bayes Factor (positive prefers Exponetial):")
-            else:
-                print("Unknown comparison")
+
+            print(f"{reference_simulator} vs {name}: Predicted Bayes Factor (positive prefers {reference_simulator}):")
+
             for _ in range(20):
                 obs = generate_from_zipf(N, alpha)
                 obs = create_compressed_obs(obs)
@@ -573,49 +676,61 @@ def train_evidence(N, all_nle, all_npe, all_loader, output_dir, evidence_estimat
 
     elif evidence_estimator == 'harmonic':
 
-        for i in range(len(all_nle)):
-            print(f'\ngetting samples {i}')
-            samples = all_npe[i].sample((10_000,), obs, show_progress_bars=True)
-            print(samples.min(), samples.max())
-            print('getting log probs')
-            lnprob = all_nle[i].potential(samples, obs)
-            print(lnprob.min(), lnprob.max())
-            print(np.unique(lnprob).shape)
-            print(obs.shape)
-            if i == -1:
-                fig, axs = plt.subplots(1, 2, figsize=(10, 4))
-                nplot = 100
-                axs[0].hist(samples[:nplot], bins=50, density=True, alpha=0.5)
-                axs[1].plot(samples[:nplot])
-                plt.show()
-            print("SHAPES", samples.shape, lnprob.shape)
+        raise NotImplementedError('Harmonic evidence estimator is not implemented yet')
 
-        estimator_zipf = HarmonicEvidence()
-        estimator_zipf.from_nde(
-            all_npe[0], all_nle[0], x=obs,
-            shape=(10_000,),
-            show_progress_bars=True
-        )
+        # for i in range(len(all_nle)):
+        #     print(f'\ngetting samples {i}')
+        #     samples = all_npe[i].sample((10_000,), obs, show_progress_bars=True)
+        #     print(samples.min(), samples.max())
+        #     print('getting log probs')
+        #     lnprob = all_nle[i].potential(samples, obs)
+        #     print(lnprob.min(), lnprob.max())
+        #     print(np.unique(lnprob).shape)
+        #     print(obs.shape)
+        #     if i == -1:
+        #         fig, axs = plt.subplots(1, 2, figsize=(10, 4))
+        #         nplot = 100
+        #         axs[0].hist(samples[:nplot], bins=50, density=True, alpha=0.5)
+        #         axs[1].plot(samples[:nplot])
+        #         # plt.show()
+        #     print("SHAPES", samples.shape, lnprob.shape)
 
-        estimator_zipf_mandel = HarmonicEvidence()
-        estimator_zipf_mandel.from_nde(
-            all_npe[1], all_nle[1], x=obs,
-            shape=(10_000,),
-            show_progress_bars=True
-        )
+        # estimator_zipf = HarmonicEvidence()
+        # estimator_zipf.from_nde(
+        #     all_npe[0], all_nle[0], x=obs,
+        #     shape=(10_000,),
+        #     show_progress_bars=True
+        # )
 
-        estimator_exponential = HarmonicEvidence()
-        estimator_exponential.from_nde(
-            all_npe[2], all_nle[2], x=obs,
-            shape=(10_000,),
-            show_progress_bars=True
-        )
+        # estimator_zipf_mandel = HarmonicEvidence()
+        # estimator_zipf_mandel.from_nde(
+        #     all_npe[1], all_nle[1], x=obs,
+        #     shape=(10_000,),
+        #     show_progress_bars=True
+        # )
 
-        K_est, stdK_est = estimator_zipf.get_bayes_factor(estimator_zipf_mandel)
-        print(f"Zipf vs Zipf Mandelbrot: Predicted Bayes Factor: {K_est:.5f} +/- {stdK_est:.5f}")
+        # estimator_exponential = HarmonicEvidence()
+        # estimator_exponential.from_nde(
+        #     all_npe[2], all_nle[2], x=obs,
+        #     shape=(10_000,),
+        #     show_progress_bars=True
+        # )
 
-        K_est, stdK_est = estimator_zipf.get_bayes_factor(estimator_exponential)
-        print(f"Zipf vs Exponential: Predicted Bayes Factor: {K_est:.5f} +/- {stdK_est:.5f}")
+        # estimator_double_exponential = HarmonicEvidence()
+        # estimator_double_exponential.from_nde(
+        #     all_npe[3], all_nle[3], x=obs,
+        #     shape=(10_000,),
+        #     show_progress_bars=True
+        # )
+
+        # K_est, stdK_est = estimator_zipf.get_bayes_factor(estimator_zipf_mandel)
+        # print(f"Zipf vs Zipf Mandelbrot: Predicted Bayes Factor: {K_est:.5f} +/- {stdK_est:.5f}")
+
+        # K_est, stdK_est = estimator_zipf.get_bayes_factor(estimator_exponential)
+        # print(f"Zipf vs Exponential: Predicted Bayes Factor: {K_est:.5f} +/- {stdK_est:.5f}")
+
+        # K_est, stdK_est = estimator_zipf.get_bayes_factor(estimator_double_exponential)
+        # print(f"Zipf vs DoubleExponential: Predicted Bayes Factor: {K_est:.5f} +/- {stdK_est:.5f}")
 
     else:
         raise ValueError('Unknown evidence estimator')
@@ -623,7 +738,7 @@ def train_evidence(N, all_nle, all_npe, all_loader, output_dir, evidence_estimat
     return
 
 
-def evaluate_models(obs, output_dir, run_name, all_model):
+def evaluate_models(obs, output_dir, run_name, all_model, do_posterior=True, do_evidence=True, reference_simulator='zipf'):
 
     # alpha = 3
     # obs = generate_from_zipf(1000, alpha)
@@ -631,98 +746,132 @@ def evaluate_models(obs, output_dir, run_name, all_model):
     compressed_obs = create_compressed_obs(obs)
     print(compressed_obs)
 
-    def zipf(x, alpha):
-        return 1 / np.power(x, alpha) / np.sum(1 / np.power(rank, alpha))
-    
-    def zipf_mandel(x, alpha, b):
-        return 1 / np.power(x+b, alpha) / np.sum(1 / np.power(rank+b, alpha))
-    
-    def exponential(x, beta):
-        return np.exp(- beta * x)
+    if do_posterior:
 
-    fig, ax = plt.subplots(1, 1, figsize=(6,4))
-    rank = np.arange(1, len(obs)+1)
-    ax.set_title(run_name[0].upper() + run_name[1:])
-    ax.plot(rank, obs, 'ko', label='Observed')
-
-    for name in all_model:
-
-        with open(f'{output_dir}/{name}_npe/posterior_ensemble.pkl', 'rb') as f:
-            posterior_ensemble = pickle.load(f)
-
-        if name == 'zipf':
-            labels = [r'$\alpha$']
-        elif name == 'zipf_mandel':
-            labels = [r'$\alpha$', r'$b$']
-        elif name == 'exponential':
-            labels = [r'$\beta$']
-        else:
-            raise ValueError('Unknown simulator')
+        def zipf(x, alpha):
+            return 1 / np.power(x, alpha) / np.sum(1 / np.power(rank, alpha))
         
-        metric = PlotSinglePosterior(
-            num_samples=5000, sample_method='direct', 
-            labels=labels,
-            save_samples=True,
-            out_dir=output_dir,
-        )
-        fig2 = metric(
-            posterior=posterior_ensemble,
-            x_obs = compressed_obs,
-            signature=name + '_',
-        )
-        plt.close(fig2.fig)
-
-        # Plot the fits on top of the data
-        samples = np.load(f'{output_dir}/{name}_single_samples.npy')
-        if name == 'zipf':
-            samples[:, 0] = 1 / samples[:, 0]
-            fits = np.array([zipf(rank, *s) for s in samples])
-        elif name == 'zipf_mandel':
-            samples[:, 0] = 1 / samples[:, 0]
-            samples[:, 1] = 1 / samples[:, 1]
-            fits = np.array([zipf_mandel(rank, *s) for s in samples])
-        elif name == 'exponential':
-            fits = np.array([exponential(rank, *s) for s in samples])
-        else:
-            raise ValueError('Unknown simulator')
+        def zipf_mandel(x, alpha, b):
+            return 1 / np.power(x+b, alpha) / np.sum(1 / np.power(rank+b, alpha))
         
-        # Normalise the fits
-        fits = fits / np.sum(fits, axis=1)[:, None] * obs.sum()
-
-        mean_fit = np.mean(fits, axis=0)
-        upper_fit = np.percentile(fits, 84, axis=0)
-        lower_fit = np.percentile(fits, 16, axis=0)
-        label = name
-        label = list(label)
-        for i, l in enumerate(label):
-            if l == '_':
-                label[i+1] = label[i+1].upper()
-        label[0] = label[0].upper()
-        label = ''.join(label)
-        label = label.replace('_', '-')
-        ax.plot(rank, mean_fit, label=label)
-        ax.fill_between(rank, lower_fit, upper_fit, alpha=0.3)
+        def exponential(x, beta):
+            return np.exp(- beta * x)
         
-    ax.set_ylim(max(0.8, ax.get_ylim()[0]), None)
-    ax.set_yscale('log')
-    ax.set_xlabel('Rank')
-    ax.set_ylabel('Frequency')
-    ax.legend()
-    fig.tight_layout()
-    fig.savefig(f'{output_dir}/{run_name}_fits.png')
-    plt.show()
+        def double_exponential(x, beta, gamma):
+            return np.exp(gamma * np.exp(- beta * x / gamma))
 
-    print('\n' + '-'*50)
-    print('Evidence evaluation')
-    print('-'*50 + '\n')
+        fig, ax = plt.subplots(1, 1, figsize=(6,4))
+        rank = np.arange(1, len(obs)+1)
+        ax.set_title(run_name[0].upper() + run_name[1:])
+        ax.plot(rank, obs, 'ko', label='Observed')
 
-    # Get evidence
-    for name in all_model[:-1]:
-        with open(f'{output_dir}/{name}_{all_model[-1]}_evidence_network.pkl', 'rb') as f:
-            runner = pickle.load(f)
-        logK = runner.predict(compressed_obs).detach().numpy()[0]
-        print(f"Zipf vs {name}: Predicted Bayes Factor (positive prefers {all_model[-1]}):")
-        print(f'Predicted lnK: {-logK[0]}')
+        for name in all_model:
+
+            with open(f'{output_dir}/{name}_npe/posterior_ensemble.pkl', 'rb') as f:
+                posterior_ensemble = pickle.load(f)
+
+            if name == 'zipf':
+                labels = [r'$\alpha$']
+            elif name == 'zipf_mandel':
+                labels = [r'$\alpha$', r'$b$']
+            elif name == 'exponential':
+                labels = [r'$\beta$']
+            elif name == 'double_exponential':
+                labels = [r'$\beta$', r'$\gamma$']
+            else:
+                raise ValueError('Unknown simulator')
+            
+            print(f'Estimator weights for {name}:', posterior_ensemble.weights)
+            
+            try:
+                with time_limit(120):
+                    metric = PlotSinglePosterior(
+                        num_samples=5000, sample_method='direct', 
+                        labels=labels,
+                        save_samples=True,
+                        out_dir=output_dir,
+                    )
+                    fig2 = metric(
+                        posterior=posterior_ensemble,
+                        # posterior=posterior_ensemble.posteriors[0],
+                        x_obs = compressed_obs,
+                        signature=name + '_',
+                    )
+                    plt.close(fig2.fig)
+            except TimeoutException:
+                print('Timeout, changing to mcmc sampling method')
+                metric = PlotSinglePosterior(
+                    num_samples=5000, sample_method='emcee', 
+                    labels=labels,
+                    save_samples=True,
+                    out_dir=output_dir,
+                )
+                fig2 = metric(
+                    posterior=posterior_ensemble,
+                    # posterior=posterior_ensemble.posteriors[0],
+                    x_obs = compressed_obs,
+                    signature=name + '_',
+                )
+                plt.close(fig2.fig)
+
+            # Plot the fits on top of the data
+            samples = np.load(f'{output_dir}/{name}_single_samples.npy')
+            if name == 'zipf':
+                samples[:, 0] = 1 / samples[:, 0]
+                fits = np.array([zipf(rank, *s) for s in samples])
+            elif name == 'zipf_mandel':
+                samples[:, 0] = 1 / samples[:, 0]
+                samples[:, 1] = 1 / samples[:, 1]
+                fits = np.array([zipf_mandel(rank, *s) for s in samples])
+            elif name == 'exponential':
+                fits = np.array([exponential(rank, *s) for s in samples])
+            elif name == 'double_exponential':
+                fits = np.array([double_exponential(rank, *s) for s in samples])
+            else:
+                raise ValueError('Unknown simulator')
+            
+            # Normalise the fits
+            fits = fits / np.sum(fits, axis=1)[:, None] * obs.sum()
+
+            mean_fit = np.mean(fits, axis=0)
+            upper_fit = np.percentile(fits, 84, axis=0)
+            lower_fit = np.percentile(fits, 16, axis=0)
+            label = name
+            label = list(label)
+            for i, l in enumerate(label):
+                if l == '_':
+                    label[i+1] = label[i+1].upper()
+            label[0] = label[0].upper()
+            label = ''.join(label)
+            label = label.replace('_', '-')
+            ax.plot(rank, mean_fit, label=label)
+            ax.fill_between(rank, lower_fit, upper_fit, alpha=0.3)
+            
+        ax.set_ylim(max(0.8, ax.get_ylim()[0]), None)
+        ax.set_yscale('log')
+        ax.set_xlabel('Rank')
+        ax.set_ylabel('Frequency')
+        ax.legend()
+        fig.tight_layout()
+        fig.savefig(f'{output_dir}/{run_name}_fits.png')
+        # plt.show()
+
+    if do_evidence:
+
+        print('\n' + '-'*50)
+        print('Evidence evaluation')
+        print('-'*50 + '\n')
+
+        # Get evidence
+        for name in all_model:
+            if name == reference_simulator:
+                print(f'Skipping {name} as it is the reference simulator')
+                continue
+            with open(f'{output_dir}/{name}_{reference_simulator}_evidence_network.pkl', 'rb') as f:
+                runner = pickle.load(f)
+            logK = runner.predict(compressed_obs).detach().numpy()[0]
+            print(f"{reference_simulator} vs {name}: Predicted Bayes Factor (positive prefers {reference_simulator}):")
+            print(f'Predicted lnK: {-logK[0]}')
 
     return
 
@@ -747,17 +896,75 @@ def simple_fitting_plot():
     plt.yscale('log')
     plt.tight_layout()
     plt.savefig('fit_zipf.png')
-    plt.show()
+    # plt.show()
 
     return
 
 
+# def make_data():
+
+#     inflation_data = [
+#     1, 110/181, 84/181, 167/362, 81/362, 35/181, 59/362,
+#     57/362, 45/362, 31/362, 13/181, 25/362, 11/181, 17/362,
+#     9/362, 7/362, 3/181, 3/362, 1/181, 1/181, 1/362, 1/362, 1/362]
+#     inflation_data = (np.array(inflation_data) * 362).astype(int)
+#     np.savetxt('data/inflation_data.txt', inflation_data, fmt='%i')
+    
+#     feynman_data = [
+#         350/1173, 5/23, 2/17, 116/1173, 97/1173, 79/1173, 12/391,
+#         10/391, 6/391, 11/1173, 11/1173, 10/1173, 3/391, 5/1173,
+#         2/1173, 2/1173, 2/1173, 1/1173, 1/1173]
+#     feynman_data = (np.array(feynman_data) * 1173).astype(int)
+#     np.savetxt('data/feynman_data.txt', feynman_data, fmt='%i')
+
+#     # Old wiki data 
+#     wiki_data = [
+#     169/550, 47/275, 37/275, 3/25, 18/275, 1/22,
+#     1/22, 17/550, 8/275, 9/550, 4/275, 1/110, 2/275,
+#     1/550, 1/550]
+#     wiki_data = (np.array(wiki_data) * 550).astype(int)
+#     np.savetxt('data/wiki_data_old.txt', wiki_data, fmt='%i')
+
+#     # New wiki data
+#     wiki_data = [
+#         443/1319, 260/1319, 136/1319, 130/1319, 71/1319, 56/1319, 
+#         55/1319, 53/1319, 23/1319, 18/1319, 16/1319, 15/1319, 13/1319,
+#         9/1319, 7/1319, 7/1319, 3/1319, 2/1319, 1/1319, 1/1319]
+#     wiki_data = (np.array(wiki_data) * 1319).astype(int)
+#     np.savetxt('data/wiki_data.txt', wiki_data, fmt='%i')
+
+#     # Cambridge handbook data
+#     # cambridge_data = [
+#     #     3104/10875, 768/3625, 454/3625, 1087/10875, 
+#     #     748/10875, 632/10875, 23/725, 338/10875, 
+#     #     67/3625, 57/3625, 31/3625, 17/2175, 14/2175, 
+#     #     68/10875, 67/10875, 37/10875, 7/2175, 1/435,
+#     #     7/3625, 16/10875, 11/10875, 3/3625, 7/10875, 
+#     #     7/10875, 4/10875, 4/10875, 4/10875, 1/3625, 
+#     #     2/10875, 2/10875, 2/10875, 1/10875, 1/10875, 
+#     #     1/10875, 1/10875, 1/10875, 1/10875, 1/10875, 
+#     #     1/10875, 1/10875, 1/10875, 1/10875
+#     # ]
+#     # cambridge_data = (np.array(cambridge_data) * 10875).astype(int)
+#     cambridge_data = [
+#         3158/11147, 2349/11147, 1500/11147, 1108/11147, 
+#         764/11147, 642/11147, 357/11147, 343/11147, 202/11147, 
+#         174/11147, 115/11147, 93/11147, 85/11147, 70/11147, 
+#         58/11147, 45/11147, 20/11147, 12/11147, 10/11147, 9/11147, 
+#         7/11147, 4/11147, 4/11147, 4/11147, 4/11147, 2/11147, 2/11147, 
+#         2/11147, 1/11147, 1/11147, 1/11147, 1/11147
+#     ]
+#     cambridge_data = (np.array(cambridge_data) * 11147).astype(int)
+#     np.savetxt('data/cambridge_data.txt', cambridge_data, fmt='%i')
+
+#     return
+
 def make_data():
 
     inflation_data = [
-    1, 110/181, 84/181, 167/362, 81/362, 35/181, 59/362,
-    57/362, 45/362, 31/362, 13/181, 25/362, 11/181, 17/362,
-    9/362, 7/362, 3/181, 3/362, 1/181, 1/181, 1/362, 1/362, 1/362]
+        1, 110/181, 84/181, 167/362, 81/362, 35/181, 59/362,
+        57/362, 45/362, 31/362, 13/181, 25/362, 11/181, 17/362,
+        9/362, 7/362, 3/181, 3/362, 1/181, 1/181, 1/362, 1/362, 1/362]
     inflation_data = (np.array(inflation_data) * 362).astype(int)
     np.savetxt('data/inflation_data.txt', inflation_data, fmt='%i')
     
@@ -767,14 +974,23 @@ def make_data():
         2/1173, 2/1173, 2/1173, 1/1173, 1/1173]
     feynman_data = (np.array(feynman_data) * 1173).astype(int)
     np.savetxt('data/feynman_data.txt', feynman_data, fmt='%i')
-        
+
     wiki_data = [
-    169/550, 47/275, 37/275, 3/25, 18/275, 1/22,
-    1/22, 17/550, 8/275, 9/550, 4/275, 1/110, 2/275,
-    1/550, 1/550]
-    wiki_data = (np.array(wiki_data) * 550).astype(int)
+        288, 134, 126, 85, 41, 38, 35, 30, 20, 8,
+        7, 7, 6, 4, 4, 2, 2, 1, 1,]
+    wiki_data = (np.array(wiki_data)).astype(int)
     np.savetxt('data/wiki_data.txt', wiki_data, fmt='%i')
-    
+
+
+    cambridge_data = [
+        2530, 2049, 1258, 970, 718, 551, 284, 282,
+        185, 133, 77, 75, 71, 69, 62, 34, 32, 12,
+        10, 8, 7, 4, 4, 3, 2, 2, 2, 2, 2, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1]
+    cambridge_data = (np.array(cambridge_data)).astype(int)
+    np.savetxt('data/cambridge_data.txt', cambridge_data, fmt='%i')
+
+
     return
 
 
@@ -785,7 +1001,12 @@ def main():
 
     make_data()
 
-    all_run_name = ['inflation', 'feynman', 'wiki']
+    all_run_name = ['inflation', 'feynman', 'wiki', 'cambridge']
+    # all_run_name = ['inflation']
+    # all_run_name = ['cambridge'] 
+    all_run_name = ['feynman']
+    # all_run_name = ['inflation', 'feynman', 'wiki']
+    reference_simulator = 'exponential'  # reference simulator for evidence estimation
 
     for run_name in all_run_name:
         obs = np.loadtxt(f'data/{run_name}_data.txt').astype(int)
@@ -796,15 +1017,21 @@ def main():
         print('\n' + '-'*50 + '\n')
         outdir = f'results/{run_name}'
 
-        to_train = ['zipf', 'zipf_mandel', 'exponential']
-        all_nle, all_npe, all_loader = train(N, Nsim, outdir, to_train=to_train, test_size=0.1)
-        train_evidence(N, all_nle, all_npe, all_loader, outdir, evidence_estimator='evidence_network')
+        to_train = ['zipf', 'zipf_mandel', 'exponential', 'double_exponential']
+        # to_train = []
+        # to_train = ['zipf_mandel']
+        # to_train = ['double_exponential']
+        # all_nle, all_npe, all_loader = train(N, Nsim, outdir, to_train=to_train, test_size=0.1, train_npe=True, train_nle=False)
+        # train_evidence(N, all_nle, all_npe, all_loader, outdir, evidence_estimator='evidence_network', 
+        #                reference_simulator=reference_simulator)
         
-        evaluate_models(obs, outdir, run_name, ['zipf', 'zipf_mandel', 'exponential'])
+        evaluate_models(obs, outdir, run_name, ['zipf_mandel', 'exponential', 'double_exponential', 'zipf'],
+                        do_posterior=False, do_evidence=True,
+                        reference_simulator=reference_simulator)
+
 
     return
 
 
 if __name__ == '__main__':
     main()
-
